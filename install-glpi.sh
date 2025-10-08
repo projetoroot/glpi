@@ -1,6 +1,6 @@
 #!/bin/bash
 # Instalador automático do GLPI no Debian 13
-# Autor: Diego Costa (@diegocostaroot) / Projeto Root
+# Autor: Diego Costa (@diegocostaroot) / Projeto Root (youtube.com/projetoroot)
 # Versão: 1.0
 # Veja o link: https://wiki.projetoroot.com.br/index.php?title=GLPI_11
 # 2025
