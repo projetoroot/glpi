@@ -98,6 +98,11 @@ sed -i 's/^upload_max_filesize = .*/upload_max_filesize = 256M/' $PHP_INI
 #grep -q '^session.cookie_httponly' $PHP_INI || echo "session.cookie_httponly = On" >> $PHP_INI
 #grep -q '^session.cookie_secure' $PHP_INI || echo "session.cookie_secure = On" >> $PHP_INI
 
+# Ajuste de TimeZone
+echo "=== Ativando suporte a Timezone no MariaDB e GLPI ==="
+mariadb-tzinfo-to-sql /usr/share/zoneinfo | mariadb -u root mysql
+sudo -u www-data php /var/www/html/glpi/bin/console database:enable_timezones
+echo "=== Reiniciando o Apache ==="
 systemctl restart apache2
 
 echo ""
