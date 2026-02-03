@@ -112,10 +112,13 @@ for deb in *.deb; do
 done
 
 if [ "$UPDATED" = true ]; then
-    if [ -x "./atualiza.sh" ]; then
-        echo "Executando atualiza.sh..."
-        ./atualiza.sh
-    fi
+    echo "Atualizando sistema..."
+    apt-get update -y
+    apt-get upgrade -y
+    apt-get dist-upgrade -y
+    apt-get autoremove -y
+    apt-get autoclean -y
+    apt-get clean
 
     echo "Reiniciando serviço glpi-agent..."
     systemctl restart glpi-agent || true
