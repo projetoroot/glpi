@@ -24,7 +24,7 @@ read -p "Digite uma senha segura para o banco de dados GLPI: " DB_PASS
 echo ""
 echo "=== Atualizando repositórios e instalando pacotes necessários ==="
 apt update -y
-apt install -y curl wget tar unzip nano apache2 mariadb-server php php-{cli,ldap,xmlrpc,soap,curl,snmp,zip,apcu,gd,mbstring,mysql,xml,bz2,intl,bcmath}
+apt install -y sudo curl wget tar unzip nano apache2 mariadb-server php php-{cli,ldap,xmlrpc,soap,curl,snmp,zip,apcu,gd,mbstring,mysql,xml,bz2,intl,bcmath}
 
 echo ""
 echo "=== Verificando banco de dados existente ==="
