@@ -1,9 +1,11 @@
 #!/bin/bash
 # Instalador automático do GLPI no Debian 13
 # Autor: Diego Costa (@diegocostaroot) / Projeto Root (youtube.com/projetoroot)
-# Versão: 1.0
+# Versão: 1.1
 # Veja o link: https://wiki.projetoroot.com.br/index.php?title=GLPI_11
-# 2025
+# 2026
+
+PATH=$PATH:/sbin:/usr/sbin
 
 set -e
 
@@ -98,21 +100,77 @@ sed -i 's/^upload_max_filesize = .*/upload_max_filesize = 256M/' $PHP_INI
 #grep -q '^session.cookie_httponly' $PHP_INI || echo "session.cookie_httponly = On" >> $PHP_INI
 #grep -q '^session.cookie_secure' $PHP_INI || echo "session.cookie_secure = On" >> $PHP_INI
 
+echo "=== Recarregando o Apache ==="
+systemctl reload apache2
+
+# Criar config_db.php para GLPI
+echo "Criando arquivo config_db.php"
+CONFIG_FILE="/var/www/html/glpi/config/config_db.php"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+cat > "$CONFIG_FILE" <<EOL
+<?php
+class DB extends DBmysql {
+  public \$dbhost = 'localhost';
+  public \$dbuser = 'glpi';
+  public \$dbpassword = '${DB_PASS}';
+  public \$dbdefault = 'glpidb';
+}
+?>
+EOL
+
+chown www-data:www-data "$CONFIG_FILE"
+chmod 640 "$CONFIG_FILE"
+
+echo "Arquivo config_db.php criado com sucesso."
+fi
+
+# Instalar o Banco no GLPI por Console
+echo "=== Instalar o Banco no GLPI por Console ==="
+sudo -u www-data php /var/www/html/glpi/bin/console db:install \
+  --db-host=localhost \
+  --db-name=glpidb \
+  --db-user=glpi \
+  --db-password="${DB_PASS}" \
+  --default-language=pt_BR \
+  --reconfigure \
+-n
+
 # Ajuste de TimeZone
 echo "=== Ativando suporte a Timezone no MariaDB e GLPI ==="
-mariadb-tzinfo-to-sql /usr/share/zoneinfo | mariadb -u root mysql
+sudo -u www-data php /var/www/html/glpi/bin/console database:update -n
+# Definir timezone global no MariaDB
+sudo mariadb -e "SET GLOBAL time_zone = 'SYSTEM';"
+# Carregar informações de timezone no MariaDB
+sudo mariadb-tzinfo-to-sql /usr/share/zoneinfo | sudo mariadb mysql
+# Ativar suporte a timezone no GLPI
 sudo -u www-data php /var/www/html/glpi/bin/console database:enable_timezones
+sudo -u www-data php /var/www/html/glpi/bin/console cache:configure --use-default
+
 echo "=== Reiniciando o Apache ==="
 systemctl restart apache2
 
 echo ""
+read -p "Deseja realizar tuning e hardening para melhorar desempenho e segurança do GLPI? (S/N): " TUNING
+
+if [[ "$TUNING" =~ ^[Ss]$ ]]; then
+    echo "=== Baixando e executando o script de tuning ==="
+    wget -O /tmp/tuning.sh https://raw.githubusercontent.com/projetoroot/glpi/refs/heads/main/tuning.sh
+    chmod +x /tmp/tuning.sh
+    /tmp/tuning.sh
+    echo ""
+    echo "=== Tuning e hardening concluídos ==="
+fi
+
 echo "=== Instalação concluída ==="
-echo "Acesse o GLPI pelo navegador em: http://${DOMAIN} ou http://<IP_DO_SERVIDOR>/glpi"
 echo ""
+echo "Acesse o GLPI pelo navegador em: http://${DOMAIN} ou http://<IP_DO_SERVIDOR>/glpi"
 echo "Banco de dados: glpidb"
 echo "Usuário: glpi"
 echo "Senha: ${DB_PASS}"
 echo "Diretório: /var/www/html/glpi"
 echo "Arquivo de conf: /etc/apache2/conf-available/glpi.conf"
 echo ""
-echo "Após o primeiro acesso, siga as instruções na interface web para concluir a instalação."
+echo "Instalação concluida com sucesso, utilizar usuário e senha padrão do GLPI para acessar."
+echo "============================"
+echo ""
