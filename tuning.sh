@@ -2,13 +2,15 @@
 # Hardening + Tuning Script com Benchmark para GLPI 11
 # Compatível Debian 13 / Ubuntu 24
 # Autor: Diego Costa (@diegocostaroot) / Projeto Root (youtube.com/projetoroot)
-# Versão: 1.0
+# Versão: 1.1
 # Veja o link: https://wiki.projetoroot.com.br/index.php?title=GLPI_11
 # 2026
-
 set -e
 PATH=$PATH:/sbin:/usr/sbin
-
+echo " "
+echo "##### Hardening + Tuning Script com Benchmark para GLPI 11 #####"
+echo "##### Configura o seu sistema para aumentar a performance e a segurança no ambiente GLPI 11 #####"
+echo " "
 # =========================
 # DEPENDÊNCIAS
 # =========================
@@ -65,6 +67,22 @@ echo "Hardware detectado:"
 echo "RAM= $(format_ram), CPU=${CPU_CORES} cores"
 echo "GLPI detectado em: $GLPI_PATH"
 echo
+
+# =========================
+# CAPTURA VARIÁVEIS MARIADB
+# =========================
+read_mysql_var() {
+    mysql -N -e "SHOW VARIABLES LIKE '$1';" 2>/dev/null | awk '{print $2}'
+}
+
+MYSQL_BEFORE_MAX_CONN=$(read_mysql_var max_connections)
+MYSQL_BEFORE_WAIT=$(read_mysql_var wait_timeout)
+MYSQL_BEFORE_INTER=$(read_mysql_var interactive_timeout)
+MYSQL_BEFORE_QCACHE=$(read_mysql_var query_cache_size)
+MYSQL_BEFORE_JOIN=$(read_mysql_var join_buffer_size)
+MYSQL_BEFORE_TABLE=$(read_mysql_var table_open_cache)
+MYSQL_BEFORE_POOL=$(read_mysql_var innodb_buffer_pool_size)
+MYSQL_BEFORE_LOG=$(read_mysql_var innodb_log_file_size)
 
 # =========================
 # HARDENING SYSCTL
@@ -184,15 +202,75 @@ apply_php_apache_mysql_tuning() {
         sed -i "s/^MaxRequestWorkers.*/MaxRequestWorkers $((CPU_CORES*50))/" "$APACHE_CONF" || true
     fi
 
-    # MySQL tuning mínimo
-    MYSQL_CNF="/etc/mysql/my.cnf"
-    if [ -f "$MYSQL_CNF" ]; then
-        sed -i "/\[mysqld\]/a innodb_buffer_pool_size=$(($RAM_KB*1024/2))" "$MYSQL_CNF"
-        sed -i "/\[mysqld\]/a max_connections=$((CPU_CORES*50))" "$MYSQL_CNF"
-    fi
+# =========================
+# MariaDB Tuning para GLPI
+# =========================
+
+if systemctl is-active mariadb >/dev/null 2>&1; then
+    echo "* Aplicando tuning MariaDB dedicado..."
+
+    MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
+
+    calc_innodb_pool() {
+        if [ "$RAM_MB" -lt 2048 ]; then echo "256M"
+        elif [ "$RAM_MB" -lt 4096 ]; then echo "512M"
+        elif [ "$RAM_MB" -lt 8192 ]; then echo "1536M"
+        elif [ "$RAM_MB" -lt 16384 ]; then echo "4G"
+        elif [ "$RAM_MB" -lt 32768 ]; then echo "8G"
+        else echo "20G"
+        fi
+    }
+
+    BUFFER_POOL=$(calc_innodb_pool)
+    BP_BYTES=$(numfmt --from=iec $BUFFER_POOL)
+    LOG_SIZE=$(numfmt --to=iec $((BP_BYTES/4)))
+
+    MAX_CONN=$((CPU_CORES*75))
+    [ $MAX_CONN -gt 600 ] && MAX_CONN=600
+
+    cat <<EOF > $MYSQL_TUNED
+[mysqld]
+max_connections = $MAX_CONN
+wait_timeout = 120
+interactive_timeout = 120
+
+query_cache_type = 0
+query_cache_size = 0
+
+join_buffer_size = 512K
+sort_buffer_size = 512K
+read_buffer_size = 256K
+read_rnd_buffer_size = 256K
+
+table_open_cache = 4000
+table_definition_cache = 2000
+
+innodb_buffer_pool_size = $BUFFER_POOL
+innodb_log_file_size = $LOG_SIZE
+innodb_flush_method = O_DIRECT
+innodb_flush_log_at_trx_commit = 2
+innodb_io_capacity = 800
+innodb_io_capacity_max = 1600
+EOF
+
+    systemctl restart mariadb
+    echo "* MariaDB ajustado"
+else
+    echo "* MariaDB não detectado, pulando tuning"
+fi
 
     echo "* Tuning de aplicações aplicado"
 }
+
+MYSQL_AFTER_MAX_CONN=$(read_mysql_var max_connections)
+MYSQL_AFTER_WAIT=$(read_mysql_var wait_timeout)
+MYSQL_AFTER_INTER=$(read_mysql_var interactive_timeout)
+MYSQL_AFTER_QCACHE=$(read_mysql_var query_cache_size)
+MYSQL_AFTER_JOIN=$(read_mysql_var join_buffer_size)
+MYSQL_AFTER_TABLE=$(read_mysql_var table_open_cache)
+MYSQL_AFTER_POOL=$(read_mysql_var innodb_buffer_pool_size)
+MYSQL_AFTER_LOG=$(read_mysql_var innodb_log_file_size)
+
 
 # =========================
 # BENCHMARK SYSBENCH
@@ -248,7 +326,18 @@ echo
 echo "===== FIREWALL ====="
 echo "Status: $(ufw status | head -n1 | awk '{print $2}')"
 ufw status | tail -n +2 | awk '{printf "  %-22s %-10s %s\n", $1, $2, $3}'
-
+echo
+echo "===== MARIADB TUNING ====="
+echo "VARIÁVEL                     | ANTES        | DEPOIS"
+echo "-----------------------------+--------------+--------------"
+printf "%-28s | %-12s | %-12s\n" "max_connections" "$MYSQL_BEFORE_MAX_CONN" "$MYSQL_AFTER_MAX_CONN"
+printf "%-28s | %-12s | %-12s\n" "wait_timeout" "$MYSQL_BEFORE_WAIT" "$MYSQL_AFTER_WAIT"
+printf "%-28s | %-12s | %-12s\n" "interactive_timeout" "$MYSQL_BEFORE_INTER" "$MYSQL_AFTER_INTER"
+printf "%-28s | %-12s | %-12s\n" "query_cache_size" "$MYSQL_BEFORE_QCACHE" "$MYSQL_AFTER_QCACHE"
+printf "%-28s | %-12s | %-12s\n" "join_buffer_size" "$MYSQL_BEFORE_JOIN" "$MYSQL_AFTER_JOIN"
+printf "%-28s | %-12s | %-12s\n" "table_open_cache" "$MYSQL_BEFORE_TABLE" "$MYSQL_AFTER_TABLE"
+printf "%-28s | %-12s | %-12s\n" "innodb_buffer_pool_size" "$MYSQL_BEFORE_POOL" "$MYSQL_AFTER_POOL"
+printf "%-28s | %-12s | %-12s\n" "innodb_log_file_size" "$MYSQL_BEFORE_LOG" "$MYSQL_AFTER_LOG"
 echo
 echo "===== HARDWARE ====="
 echo "RAM                       : $(format_ram)"
