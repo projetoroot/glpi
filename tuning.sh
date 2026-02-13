@@ -211,20 +211,36 @@ if systemctl is-active mariadb >/dev/null 2>&1; then
 
     MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
 
-    calc_innodb_pool() {
-        if [ "$RAM_MB" -lt 2048 ]; then echo "256M"
-        elif [ "$RAM_MB" -lt 4096 ]; then echo "512M"
-        elif [ "$RAM_MB" -lt 8192 ]; then echo "1536M"
-        elif [ "$RAM_MB" -lt 16384 ]; then echo "4G"
-        elif [ "$RAM_MB" -lt 32768 ]; then echo "8G"
-        else echo "20G"
+    # Buffer pool baseado na RAM
+    calc_pool_mb() {
+        if [ "$RAM_MB" -lt 2048 ]; then echo 256
+        elif [ "$RAM_MB" -lt 4096 ]; then echo 512
+        elif [ "$RAM_MB" -lt 8192 ]; then echo 1536
+        elif [ "$RAM_MB" -lt 16384 ]; then echo 4096
+        elif [ "$RAM_MB" -lt 32768 ]; then echo 8192
+        else echo 20480
         fi
     }
 
-    BUFFER_POOL=$(calc_innodb_pool)
-    BP_BYTES=$(numfmt --from=iec $BUFFER_POOL)
-    LOG_SIZE=$(numfmt --to=iec $((BP_BYTES/4)))
+    POOL_MB=$(calc_pool_mb)
 
+    # Log file = 25% do pool (inteiro)
+    LOG_MB=$((POOL_MB/4))
+
+    # Formatação SEM decimal
+    if [ $POOL_MB -ge 1024 ]; then
+        BUFFER_POOL="$((POOL_MB/1024))G"
+    else
+        BUFFER_POOL="${POOL_MB}M"
+    fi
+
+    if [ $LOG_MB -ge 1024 ]; then
+        LOG_SIZE="$((LOG_MB/1024))G"
+    else
+        LOG_SIZE="${LOG_MB}M"
+    fi
+
+    # Conexões por CPU
     MAX_CONN=$((CPU_CORES*75))
     [ $MAX_CONN -gt 600 ] && MAX_CONN=600
 
@@ -253,13 +269,17 @@ innodb_io_capacity = 800
 innodb_io_capacity_max = 1600
 EOF
 
-    systemctl restart mariadb
-    echo "* MariaDB ajustado"
+    # Validação antes do restart
+    if mariadbd --verbose --help >/dev/null 2>&1; then
+        systemctl restart mariadb
+        echo "* MariaDB ajustado"
+    else
+        echo "ERRO: Configuração inválida — não reiniciado"
+    fi
+
 else
     echo "* MariaDB não detectado, pulando tuning"
 fi
-
-    echo "* Tuning de aplicações aplicado"
 }
 
 MYSQL_AFTER_MAX_CONN=$(read_mysql_var max_connections)
