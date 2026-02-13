@@ -164,7 +164,7 @@ EOF
 # PHP / Apache / MySQL TUNING
 # =========================
 apply_php_apache_mysql_tuning() {
-    echo "* Aplicando tuning de Apache, PHP e MySQL/PostgreSQL..."
+    echo "* Aplicando tuning de Apache, PHP e MySQL..."
 
     # PHP
     PHP_INI=$(php -r "echo php_ini_loaded_file();" 2>/dev/null)
