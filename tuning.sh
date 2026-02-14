@@ -83,6 +83,37 @@ echo "RAM= $(format_ram), CPU=${CPU_CORES} cores"
 echo "GLPI detectado em: $GLPI_PATH"
 echo
 
+
+# =========================
+# VARIAVÉIS VAZIAS
+# =========================
+APACHE_BEFORE_MAXREQ="N/A"
+APACHE_AFTER_MAXREQ="N/A"
+PHP_BEFORE_MEMORY="N/A"
+PHP_AFTER_MEMORY="N/A"
+
+# =========================
+# CAPTURA VARIÁVEIS APACHE
+# =========================
+
+APACHE_BEFORE_KEEPALIVE=$(apachectl -M 2>/dev/null | grep -i keepalive || echo "off")
+APACHE_BEFORE_MAXREQ=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null | grep -i MaxRequestWorkers | awk '{print $2}')
+APACHE_BEFORE_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf | awk '{print $2}')
+
+
+
+# =========================
+# CAPTURA VARIÁVEIS PHP
+# =========================
+
+PHP_INI=$(php -i | grep "Loaded Configuration" | awk '{print $5}')
+
+PHP_BEFORE_MEMORY=$(php -r "echo ini_get('memory_limit');")
+PHP_BEFORE_OPCACHE=$(php -r "echo ini_get('opcache.memory_consumption');")
+PHP_BEFORE_MAXEXEC=$(php -r "echo ini_get('max_execution_time');")
+PHP_BEFORE_UPLOAD=$(php -r "echo ini_get('upload_max_filesize');")
+
+
 # =========================
 # CAPTURA VARIÁVEIS MARIADB
 # =========================
@@ -354,16 +385,47 @@ EOF
 sleep 5
 
 MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
-EXPECTED_RAW=$(grep innodb_buffer_pool_size "$MYSQL_TUNED" | awk -F= '{print $2}' | xargs)
 
-EXPECTED_BYTES=$(numfmt --from=iec "$EXPECTED_RAW")
-APPLIED=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+if [ -f "$MYSQL_TUNED" ]; then
 
-if [ "$APPLIED" = "$EXPECTED_BYTES" ]; then
-    echo "OK: MariaDB carregou o tuning"
+    EXPECTED_RAW=$(grep -i innodb_buffer_pool_size "$MYSQL_TUNED" | awk -F= '{print $2}' | xargs)
+
+    if [ -n "$EXPECTED_RAW" ]; then
+
+        EXPECTED_BYTES=$(numfmt --from=iec "$EXPECTED_RAW")
+        APPLIED=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+
+        if [ "$APPLIED" = "$EXPECTED_BYTES" ]; then
+            echo "OK: MariaDB carregou o tuning"
+        else
+            echo "ERRO: MariaDB não carregou tuning"
+        fi
+
+    else
+        echo "Aviso: tuning não contém innodb_buffer_pool_size"
+    fi
+
 else
-    echo "ERRO: MariaDB NÃO carregou tuning"
+    echo "Aviso: arquivo de tuning MariaDB ainda não existe"
 fi
+
+
+# =========================
+# CAPTURA DEPOIS APACHE
+# =========================
+
+APACHE_AFTER_KEEPALIVE=$(apachectl -M 2>/dev/null | grep -i keepalive || echo "off")
+APACHE_AFTER_MAXREQ=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null | grep -i MaxRequestWorkers | awk '{print $2}')
+APACHE_AFTER_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf | awk '{print $2}')
+
+# =========================
+# CAPTURA DEPOIS PHP
+# =========================
+
+PHP_AFTER_MEMORY=$(php -r "echo ini_get('memory_limit');")
+PHP_AFTER_OPCACHE=$(php -r "echo ini_get('opcache.memory_consumption');")
+PHP_AFTER_MAXEXEC=$(php -r "echo ini_get('max_execution_time');")
+PHP_AFTER_UPLOAD=$(php -r "echo ini_get('upload_max_filesize');")
 
 
 
@@ -438,6 +500,18 @@ echo
 echo "===== FIREWALL ====="
 echo "Status: $(ufw status | head -n1 | awk '{print $2}')"
 ufw status | tail -n +2 | awk '{printf "  %-22s %-10s %s\n", $1, $2, $3}'
+echo
+echo "===== APACHE TUNING ====="
+printf "%-25s | %-12s | %-12s\n" "ITEM" "ANTES" "DEPOIS"
+printf "%-25s | %-12s | %-12s\n" "MaxRequestWorkers" "$APACHE_BEFORE_MAXREQ" "$APACHE_AFTER_MAXREQ"
+printf "%-25s | %-12s | %-12s\n" "Timeout" "$APACHE_BEFORE_TIMEOUT" "$APACHE_AFTER_TIMEOUT"
+echo
+echo "===== PHP TUNING ====="
+printf "%-25s | %-12s | %-12s\n" "ITEM" "ANTES" "DEPOIS"
+printf "%-25s | %-12s | %-12s\n" "memory_limit" "$PHP_BEFORE_MEMORY" "$PHP_AFTER_MEMORY"
+printf "%-25s | %-12s | %-12s\n" "opcache_memory" "$PHP_BEFORE_OPCACHE" "$PHP_AFTER_OPCACHE"
+printf "%-25s | %-12s | %-12s\n" "max_execution_time" "$PHP_BEFORE_MAXEXEC" "$PHP_AFTER_MAXEXEC"
+printf "%-25s | %-12s | %-12s\n" "upload_max_filesize" "$PHP_BEFORE_UPLOAD" "$PHP_AFTER_UPLOAD"
 echo
 echo "===== MARIADB TUNING ====="
 echo "VARIÁVEL                     | ANTES        | DEPOIS"
