@@ -15,17 +15,32 @@ echo " "
 # DEPENDÊNCIAS
 # =========================
 echo "* Verificando dependências..."
-for pkg in bc procps ufw sysbench jq curl wget sudo; do
-    if ! dpkg -s $pkg >/dev/null 2>&1; then
-        echo "* Instalando $pkg..."
-        apt update -qq
-        apt install -y $pkg >/dev/null
+
+REQUIRED_PKGS="bc procps ufw sysbench jq curl wget sudo"
+MISSING_PKGS=""
+
+for pkg in $REQUIRED_PKGS; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        MISSING_PKGS="$MISSING_PKGS $pkg"
     fi
 done
+
+if [ -n "$MISSING_PKGS" ]; then
+    echo "* Instalando dependências:$MISSING_PKGS"
+    apt update -qq
+    apt install -y $MISSING_PKGS >/dev/null
+else
+    echo "* Nenhuma instalação necessária"
+fi
+
 echo "* Dependências OK"
 
 BACKUP_DIR="/var/backups/glpi-tuner/$(date +%s)"
 mkdir -p "$BACKUP_DIR"
+cp -r /etc/apache2 "$BACKUP_DIR/" || true
+cp -r /etc/mysql "$BACKUP_DIR/" || true
+cp -r /etc/php "$BACKUP_DIR/" || true
+
 
 # =========================
 # DETECTA HARDWARE
@@ -179,72 +194,120 @@ EOF
 }
 
 # =========================
-# PHP / Apache / MySQL TUNING
+# PHP / Apache / MariaDB TUNING
 # =========================
 apply_php_apache_mysql_tuning() {
-    echo "* Aplicando tuning de Apache, PHP e MySQL..."
 
-    # PHP
+    echo "* Aplicando tuning PHP, Apache e MariaDB..."
+
+    # =========================
+    # PHP TUNING POR RAM
+    # =========================
+
+    calc_php_mem() {
+        if [ "$RAM_MB" -lt 1024 ]; then echo 128M
+        elif [ "$RAM_MB" -lt 2048 ]; then echo 192M
+        elif [ "$RAM_MB" -lt 4096 ]; then echo 256M
+        elif [ "$RAM_MB" -lt 8192 ]; then echo 384M
+        elif [ "$RAM_MB" -lt 16384 ]; then echo 512M
+        else echo 768M
+        fi
+    }
+
+    PHP_MEM=$(calc_php_mem)
     PHP_INI=$(php -r "echo php_ini_loaded_file();" 2>/dev/null)
+
     if [ -f "$PHP_INI" ]; then
-        sed -i "s/^memory_limit.*/memory_limit = 512M/" "$PHP_INI"
+        sed -i "s/^memory_limit.*/memory_limit = $PHP_MEM/" "$PHP_INI"
         sed -i "s/^max_execution_time.*/max_execution_time = 300/" "$PHP_INI"
         sed -i "s/^post_max_size.*/post_max_size = 128M/" "$PHP_INI"
         sed -i "s/^upload_max_filesize.*/upload_max_filesize = 128M/" "$PHP_INI"
     fi
 
-    # Apache
-    APACHE_CONF="/etc/apache2/apache2.conf"
-    if [ -f "$APACHE_CONF" ]; then
-        sed -i "s/^StartServers.*/StartServers $((CPU_CORES))/" "$APACHE_CONF" || true
-        sed -i "s/^MinSpareServers.*/MinSpareServers $((CPU_CORES*2))/" "$APACHE_CONF" || true
-        sed -i "s/^MaxSpareServers.*/MaxSpareServers $((CPU_CORES*4))/" "$APACHE_CONF" || true
-        sed -i "s/^MaxRequestWorkers.*/MaxRequestWorkers $((CPU_CORES*50))/" "$APACHE_CONF" || true
-    fi
+    # =========================
+    # APACHE TUNING REAL (RAM + CPU)
+    # =========================
 
-# =========================
-# MariaDB Tuning para GLPI
-# =========================
+    APACHE_MPM=$(apachectl -V 2>/dev/null | grep -i mpm | awk -F: '{print $2}' | tr -d ' ')
 
-if systemctl is-active mariadb >/dev/null 2>&1; then
-    echo "* Aplicando tuning MariaDB dedicado..."
+    calc_workers() {
+        MEM_PER_CHILD=60
+        MAX_RAM=$((RAM_MB / MEM_PER_CHILD))
+        MAX_CPU=$((CPU_CORES * 40))
 
-    MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
-
-    # Buffer pool baseado na RAM
-    calc_pool_mb() {
-        if [ "$RAM_MB" -lt 2048 ]; then echo 256
-        elif [ "$RAM_MB" -lt 4096 ]; then echo 512
-        elif [ "$RAM_MB" -lt 8192 ]; then echo 1536
-        elif [ "$RAM_MB" -lt 16384 ]; then echo 4096
-        elif [ "$RAM_MB" -lt 32768 ]; then echo 8192
-        else echo 20480
+        if [ "$MAX_RAM" -lt "$MAX_CPU" ]; then
+            echo "$MAX_RAM"
+        else
+            echo "$MAX_CPU"
         fi
     }
 
-    POOL_MB=$(calc_pool_mb)
+    MAX_REQ=$(calc_workers)
 
-    # Log file = 25% do pool (inteiro)
-    LOG_MB=$((POOL_MB/4))
+    if [ "$APACHE_MPM" = "prefork" ]; then
 
-    # Formatação SEM decimal
-    if [ $POOL_MB -ge 1024 ]; then
-        BUFFER_POOL="$((POOL_MB/1024))G"
+cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
+StartServers             $CPU_CORES
+MinSpareServers          $CPU_CORES
+MaxSpareServers          $((CPU_CORES*2))
+MaxRequestWorkers        $MAX_REQ
+MaxConnectionsPerChild   1000
+EOF
+
     else
-        BUFFER_POOL="${POOL_MB}M"
+
+cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
+StartServers              2
+ThreadsPerChild           25
+MinSpareThreads           50
+MaxSpareThreads           150
+MaxRequestWorkers         $((MAX_REQ*2))
+MaxConnectionsPerChild    2000
+EOF
+
     fi
 
-    if [ $LOG_MB -ge 1024 ]; then
-        LOG_SIZE="$((LOG_MB/1024))G"
-    else
-        LOG_SIZE="${LOG_MB}M"
-    fi
+    a2enconf glpi-mpm >/dev/null 2>&1 || true
+    systemctl reload apache2 >/dev/null 2>&1 || true
 
-    # Conexões por CPU
-    MAX_CONN=$((CPU_CORES*75))
-    [ $MAX_CONN -gt 600 ] && MAX_CONN=600
 
-    cat <<EOF > $MYSQL_TUNED
+    # =========================
+    # MariaDB TUNING
+    # =========================
+
+    if systemctl is-active mariadb >/dev/null 2>&1; then
+
+        MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
+
+        calc_pool_mb() {
+            if [ "$RAM_MB" -lt 2048 ]; then echo 256
+            elif [ "$RAM_MB" -lt 4096 ]; then echo 512
+            elif [ "$RAM_MB" -lt 8192 ]; then echo 1536
+            elif [ "$RAM_MB" -lt 16384 ]; then echo 4096
+            elif [ "$RAM_MB" -lt 32768 ]; then echo 8192
+            else echo 20480
+            fi
+        }
+
+        POOL_MB=$(calc_pool_mb)
+        LOG_MB=$((POOL_MB/4))
+
+        if [ $POOL_MB -ge 1024 ]; then
+            BUFFER_POOL="$((POOL_MB/1024))G"
+        else
+            BUFFER_POOL="${POOL_MB}M"
+        fi
+
+        if [ $LOG_MB -ge 1024 ]; then
+            LOG_SIZE="$((LOG_MB/1024))G"
+        else
+            LOG_SIZE="${LOG_MB}M"
+        fi
+
+        MAX_CONN=$((CPU_CORES*75))
+        [ $MAX_CONN -gt 600 ] && MAX_CONN=600
+
+cat <<EOF > $MYSQL_TUNED
 [mysqld]
 max_connections = $MAX_CONN
 wait_timeout = 120
@@ -269,27 +332,39 @@ innodb_io_capacity = 800
 innodb_io_capacity_max = 1600
 EOF
 
-    # Validação antes do restart
-    if mariadbd --verbose --help >/dev/null 2>&1; then
-        systemctl restart mariadb
-        echo "* MariaDB ajustado"
-    else
-        echo "ERRO: Configuração inválida — não reiniciado"
+        if mariadbd --verbose --help >/dev/null 2>&1; then
+            systemctl restart mariadb
+        fi
+
+        sleep 4
+
+        EXPECTED=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+
+        if [ -n "$EXPECTED" ]; then
+            echo "* MariaDB tuning carregado"
+        else
+            echo "* Falha ao validar tuning MariaDB"
+        fi
+
     fi
 
-else
-    echo "* MariaDB não detectado, pulando tuning"
-fi
+    echo "* Tuning aplicado"
 }
 
-MYSQL_AFTER_MAX_CONN=$(read_mysql_var max_connections)
-MYSQL_AFTER_WAIT=$(read_mysql_var wait_timeout)
-MYSQL_AFTER_INTER=$(read_mysql_var interactive_timeout)
-MYSQL_AFTER_QCACHE=$(read_mysql_var query_cache_size)
-MYSQL_AFTER_JOIN=$(read_mysql_var join_buffer_size)
-MYSQL_AFTER_TABLE=$(read_mysql_var table_open_cache)
-MYSQL_AFTER_POOL=$(read_mysql_var innodb_buffer_pool_size)
-MYSQL_AFTER_LOG=$(read_mysql_var innodb_log_file_size)
+sleep 5
+
+MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
+EXPECTED_RAW=$(grep innodb_buffer_pool_size "$MYSQL_TUNED" | awk -F= '{print $2}' | xargs)
+
+EXPECTED_BYTES=$(numfmt --from=iec "$EXPECTED_RAW")
+APPLIED=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+
+if [ "$APPLIED" = "$EXPECTED_BYTES" ]; then
+    echo "OK: MariaDB carregou o tuning"
+else
+    echo "ERRO: MariaDB NÃO carregou tuning"
+fi
+
 
 
 # =========================
@@ -323,6 +398,23 @@ apply_sysctl
 configure_firewall
 apply_network_tuning
 apply_php_apache_mysql_tuning
+# =========================
+# CAPTURA AFTER MARIADB
+# =========================
+echo "* Capturando variáveis MariaDB pós-tuning..."
+systemctl is-active mariadb >/dev/null || systemctl start mariadb
+
+sleep 2
+
+MYSQL_AFTER_MAX_CONN=$(read_mysql_var max_connections)
+MYSQL_AFTER_WAIT=$(read_mysql_var wait_timeout)
+MYSQL_AFTER_INTER=$(read_mysql_var interactive_timeout)
+MYSQL_AFTER_QCACHE=$(read_mysql_var query_cache_size)
+MYSQL_AFTER_JOIN=$(read_mysql_var join_buffer_size)
+MYSQL_AFTER_TABLE=$(read_mysql_var table_open_cache)
+MYSQL_AFTER_POOL=$(read_mysql_var innodb_buffer_pool_size)
+MYSQL_AFTER_LOG=$(read_mysql_var innodb_log_file_size)
+
 run_benchmark
 
 # =========================
