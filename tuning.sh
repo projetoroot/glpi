@@ -5,8 +5,19 @@
 # Versão: 1.1
 # Veja o link: https://wiki.projetoroot.com.br/index.php?title=GLPI_11
 # 2026
-set -e
-PATH=$PATH:/sbin:/usr/sbin
+
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+[ "$EUID" -ne 0 ] && echo "Execute como root" && exit 1
+
+APACHECTL=$(command -v apache2ctl || command -v apachectl)
+
+if [ -z "$APACHECTL" ]; then
+    echo "Apache control binary não encontrado"
+    exit 1
+fi
+
 echo " "
 echo "##### Hardening + Tuning Script com Benchmark para GLPI 11 #####"
 echo "##### Configura o seu sistema para aumentar a performance e a segurança no ambiente GLPI 11 #####"
@@ -37,9 +48,8 @@ echo "* Dependências OK"
 
 BACKUP_DIR="/var/backups/glpi-tuner/$(date +%s)"
 mkdir -p "$BACKUP_DIR"
-cp -r /etc/apache2 "$BACKUP_DIR/" || true
-cp -r /etc/mysql "$BACKUP_DIR/" || true
-cp -r /etc/php "$BACKUP_DIR/" || true
+cp -r /etc/{apache2,mysql,php,ssh,sysctl.d,ufw} "$BACKUP_DIR/" 2>/dev/null || true
+echo "* Backup em $BACKUP_DIR"
 
 
 # =========================
@@ -87,20 +97,133 @@ echo
 # =========================
 # VARIAVÉIS VAZIAS
 # =========================
-APACHE_BEFORE_MAXREQ="N/A"
-APACHE_AFTER_MAXREQ="N/A"
 PHP_BEFORE_MEMORY="N/A"
 PHP_AFTER_MEMORY="N/A"
+APACHE_BEFORE_MAXREQ="N/A"
+APACHE_AFTER_MAXREQ="N/A"
+APACHE_BEFORE_KEEPALIVE="N/A"
+APACHE_AFTER_KEEPALIVE="N/A"
+APACHE_BEFORE_TIMEOUT="N/A"
+APACHE_AFTER_TIMEOUT="N/A"
+
 
 # =========================
-# CAPTURA VARIÁVEIS APACHE
+# Server Name
 # =========================
 
-APACHE_BEFORE_KEEPALIVE=$(apachectl -M 2>/dev/null | grep -i keepalive || echo "off")
-APACHE_BEFORE_MAXREQ=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null | grep -i MaxRequestWorkers | awk '{print $2}')
-APACHE_BEFORE_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf | awk '{print $2}')
+configure_apache_servername() {
+    local CONF_FILE="/etc/apache2/conf-available/servername.conf"
+    local HOSTNAME_VALUE
 
+    # Usa o hostname do sistema ou localhost como fallback
+    HOSTNAME_VALUE=$(hostname -f 2>/dev/null || echo "localhost")
 
+    # Cria arquivo de configuração se não existir
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "ServerName $HOSTNAME_VALUE" > "$CONF_FILE"
+        a2enconf servername >/dev/null 2>&1 || true
+        systemctl reload apache2 >/dev/null 2>&1 || true
+        echo "* Apache ServerName configurado como $HOSTNAME_VALUE"
+    fi
+}
+
+configure_apache_servername
+
+# =========================
+# AJUSTE SERVERLIMIT E MAXREQUESTWORKERS
+# =========================
+
+APACHECTL=$(command -v apache2ctl || command -v apachectl)
+
+detect_apache_mpm_file() {
+    if $APACHECTL -M 2>/dev/null | grep -q mpm_event; then
+        echo "/etc/apache2/mods-available/mpm_event.conf"
+    elif $APACHECTL -M 2>/dev/null | grep -q mpm_worker; then
+        echo "/etc/apache2/mods-available/mpm_worker.conf"
+    elif $APACHECTL -M 2>/dev/null | grep -q mpm_prefork; then
+        echo "/etc/apache2/mods-available/mpm_prefork.conf"
+    else
+        echo ""
+    fi
+}
+
+APACHE_MPM_FILE=$(detect_apache_mpm_file)
+TARGET_WORKERS=150
+
+if [ -f "$APACHE_MPM_FILE" ]; then
+    # ServerLimit sempre >= TARGET_WORKERS
+    if grep -q "ServerLimit" "$APACHE_MPM_FILE"; then
+        sed -i "s/^\s*ServerLimit.*/ServerLimit ${TARGET_WORKERS}/" "$APACHE_MPM_FILE"
+    else
+        echo "ServerLimit ${TARGET_WORKERS}" >> "$APACHE_MPM_FILE"
+    fi
+
+    # MaxRequestWorkers nunca ultrapassa ServerLimit
+    if grep -q "MaxRequestWorkers" "$APACHE_MPM_FILE"; then
+        sed -i "s/^\s*MaxRequestWorkers.*/MaxRequestWorkers ${TARGET_WORKERS}/" "$APACHE_MPM_FILE"
+    else
+        echo "MaxRequestWorkers ${TARGET_WORKERS}" >> "$APACHE_MPM_FILE"
+    fi
+
+    systemctl reload apache2 >/dev/null 2>&1 || true
+fi
+
+# =========================
+# CÁLCULO DINÂMICO PARA MAX_REQ (RAM + CPU) 1x
+# =========================
+
+calc_workers() {
+    MEM_PER_CHILD=96
+    MAX_RAM=$((RAM_MB / MEM_PER_CHILD))
+    MAX_CPU=$((CPU_CORES * 40))
+
+    if [ "$MAX_RAM" -lt "$MAX_CPU" ]; then
+        MAX=$MAX_RAM
+    else
+        MAX=$MAX_CPU
+    fi
+
+    # Garante que nunca ultrapasse TARGET_WORKERS
+    if [ "$MAX" -gt "$TARGET_WORKERS" ]; then
+        MAX=$TARGET_WORKERS
+    fi
+
+    echo "$MAX"
+}
+
+MAX_REQ=$(calc_workers)
+
+# =========================
+# FUNÇÕES CAPTURA APACHE
+# =========================
+
+get_apache_maxworkers() {
+    local CONF="/etc/apache2/conf-available/glpi-mpm.conf"
+    if [ -f "$CONF" ]; then
+        awk '/MaxRequestWorkers/ {print $2}' "$CONF"
+    else
+        echo "N/A"
+    fi
+}
+
+get_apache_keepalive() {
+    local v
+    v=$(grep -i "^KeepAlive" /etc/apache2/apache2.conf 2>/dev/null | awk '{print $2}' | head -n1)
+    echo "${v:-N/A}"
+}
+
+###################
+APACHE_BEFORE_MAXREQ=$(get_apache_maxworkers)
+APACHE_BEFORE_KEEPALIVE=$(get_apache_keepalive)
+APACHE_BEFORE_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf 2>/dev/null | awk '{print $2}' | head -n1)
+APACHE_BEFORE_TIMEOUT=${APACHE_BEFORE_TIMEOUT:-N/A}
+PHP_BEFORE_OPCACHE=${PHP_BEFORE_OPCACHE:-N/A}
+#################
+APACHE_AFTER_MAXREQ=$(get_apache_maxworkers)
+APACHE_AFTER_KEEPALIVE=$(get_apache_keepalive)
+APACHE_AFTER_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf 2>/dev/null | awk '{print $2}' | head -n1)
+APACHE_AFTER_TIMEOUT=${APACHE_AFTER_TIMEOUT:-N/A}
+PHP_AFTER_OPCACHE=${PHP_AFTER_OPCACHE:-N/A}
 
 # =========================
 # CAPTURA VARIÁVEIS PHP
@@ -228,13 +351,11 @@ EOF
 # PHP / Apache / MariaDB TUNING
 # =========================
 apply_php_apache_mysql_tuning() {
-
     echo "* Aplicando tuning PHP, Apache e MariaDB..."
 
     # =========================
     # PHP TUNING POR RAM
     # =========================
-
     calc_php_mem() {
         if [ "$RAM_MB" -lt 1024 ]; then echo 128M
         elif [ "$RAM_MB" -lt 2048 ]; then echo 192M
@@ -250,64 +371,60 @@ apply_php_apache_mysql_tuning() {
 
     if [ -f "$PHP_INI" ]; then
         sed -i "s/^memory_limit.*/memory_limit = $PHP_MEM/" "$PHP_INI"
-        sed -i "s/^max_execution_time.*/max_execution_time = 300/" "$PHP_INI"
+        sed -i "s/^max_execution_time.*/max_execution_time = 600/" "$PHP_INI"
         sed -i "s/^post_max_size.*/post_max_size = 128M/" "$PHP_INI"
         sed -i "s/^upload_max_filesize.*/upload_max_filesize = 128M/" "$PHP_INI"
     fi
 
+    PHP_AFTER_MEMORY=$(php -r "echo ini_get('memory_limit');")
+    PHP_AFTER_OPCACHE=$(php -r "echo ini_get('opcache.memory_consumption');")
+    PHP_AFTER_MAXEXEC=$(php -r "echo ini_get('max_execution_time');")
+    PHP_AFTER_UPLOAD=$(php -r "echo ini_get('upload_max_filesize');")
+
     # =========================
-    # APACHE TUNING REAL (RAM + CPU)
+    # APACHE TUNING DINÂMICO
     # =========================
 
-    APACHE_MPM=$(apachectl -V 2>/dev/null | grep -i mpm | awk -F: '{print $2}' | tr -d ' ')
+    # Desativa tuning antigo se existir
+    a2disconf glpi-mpm >/dev/null 2>&1 || true
+    rm -f /etc/apache2/conf-available/glpi-mpm.conf
+    systemctl reload apache2 >/dev/null 2>&1 || true
 
-    calc_workers() {
-        MEM_PER_CHILD=60
-        MAX_RAM=$((RAM_MB / MEM_PER_CHILD))
-        MAX_CPU=$((CPU_CORES * 40))
+    # Cria arquivo glpi-mpm.conf baseado em RAM e CPU
+MPM_TYPE=$($APACHECTL -M 2>/dev/null | grep -Eo 'mpm_[a-z]+')
 
-        if [ "$MAX_RAM" -lt "$MAX_CPU" ]; then
-            echo "$MAX_RAM"
-        else
-            echo "$MAX_CPU"
-        fi
-    }
-
-    MAX_REQ=$(calc_workers)
-
-    if [ "$APACHE_MPM" = "prefork" ]; then
-
-cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
+if [ "$MPM_TYPE" = "mpm_prefork" ]; then
+    cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
 StartServers             $CPU_CORES
 MinSpareServers          $CPU_CORES
 MaxSpareServers          $((CPU_CORES*2))
 MaxRequestWorkers        $MAX_REQ
 MaxConnectionsPerChild   1000
 EOF
-
-    else
-
-cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
-StartServers              2
-ThreadsPerChild           25
-MinSpareThreads           50
-MaxSpareThreads           150
-MaxRequestWorkers         $((MAX_REQ*2))
-MaxConnectionsPerChild    2000
+else
+    cat <<EOF > /etc/apache2/conf-available/glpi-mpm.conf
+StartServers             2
+ThreadsPerChild          25
+MinSpareThreads          50
+MaxSpareThreads          150
+MaxRequestWorkers        $MAX_REQ
+MaxConnectionsPerChild   2000
 EOF
-
-    fi
+fi
 
     a2enconf glpi-mpm >/dev/null 2>&1 || true
-    systemctl reload apache2 >/dev/null 2>&1 || true
+    apache2ctl configtest || exit 1
+    systemctl reload apache2
 
+    APACHE_AFTER_MAXREQ=$(get_apache_maxworkers)
+    APACHE_AFTER_KEEPALIVE=$(get_apache_keepalive)
+    APACHE_AFTER_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf 2>/dev/null | awk '{print $2}' | head -n1)
+    APACHE_AFTER_TIMEOUT=${APACHE_AFTER_TIMEOUT:-N/A}
 
     # =========================
-    # MariaDB TUNING
+    # MARIADB TUNING
     # =========================
-
     if systemctl is-active mariadb >/dev/null 2>&1; then
-
         MYSQL_TUNED="/etc/mysql/mariadb.conf.d/99-glpi-tuned.cnf"
 
         calc_pool_mb() {
@@ -338,7 +455,7 @@ EOF
         MAX_CONN=$((CPU_CORES*75))
         [ $MAX_CONN -gt 600 ] && MAX_CONN=600
 
-cat <<EOF > $MYSQL_TUNED
+        cat <<EOF > $MYSQL_TUNED
 [mysqld]
 max_connections = $MAX_CONN
 wait_timeout = 120
@@ -363,20 +480,15 @@ innodb_io_capacity = 800
 innodb_io_capacity_max = 1600
 EOF
 
-        if mariadbd --verbose --help >/dev/null 2>&1; then
-            systemctl restart mariadb
-        fi
-
+        systemctl restart mariadb
         sleep 4
 
         EXPECTED=$(mysql -Nse "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
-
         if [ -n "$EXPECTED" ]; then
             echo "* MariaDB tuning carregado"
         else
             echo "* Falha ao validar tuning MariaDB"
         fi
-
     fi
 
     echo "* Tuning aplicado"
@@ -414,19 +526,12 @@ fi
 # CAPTURA DEPOIS APACHE
 # =========================
 
-APACHE_AFTER_KEEPALIVE=$(apachectl -M 2>/dev/null | grep -i keepalive || echo "off")
-APACHE_AFTER_MAXREQ=$(apachectl -t -D DUMP_RUN_CFG 2>/dev/null | grep -i MaxRequestWorkers | awk '{print $2}')
-APACHE_AFTER_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf | awk '{print $2}')
+APACHE_AFTER_MAXREQ=$(get_apache_maxworkers)
+APACHE_AFTER_KEEPALIVE=$(get_apache_keepalive)
 
-# =========================
-# CAPTURA DEPOIS PHP
-# =========================
-
-PHP_AFTER_MEMORY=$(php -r "echo ini_get('memory_limit');")
-PHP_AFTER_OPCACHE=$(php -r "echo ini_get('opcache.memory_consumption');")
-PHP_AFTER_MAXEXEC=$(php -r "echo ini_get('max_execution_time');")
-PHP_AFTER_UPLOAD=$(php -r "echo ini_get('upload_max_filesize');")
-
+APACHE_AFTER_TIMEOUT=$(grep -i "^Timeout" /etc/apache2/apache2.conf 2>/dev/null \
+    | awk '{print $2}' | head -n1)
+APACHE_AFTER_TIMEOUT=${APACHE_AFTER_TIMEOUT:-N/A}
 
 
 # =========================
@@ -442,10 +547,8 @@ run_benchmark() {
 
     # Memória
     MEM_BEFORE=$(sysbench memory --memory-block-size=1M --memory-total-size=64M run \
-             | grep "transferred" \
-             | awk '{print $1, $2 " transferred at " $5}')
+                | awk '/transferred/ {gsub(/[()]/,"",$9); print $1, $2, "transferred at", $9 " MiB/sec"}')
     BENCH_MEM="${MEM_BEFORE:-"-"}"
-
     # Disco
     sysbench fileio --file-total-size=64M --file-test-mode=seqwr prepare >/dev/null
     DISK_BEFORE=$(sysbench fileio --file-total-size=64M --file-test-mode=seqwr run | grep "total time:" | awk '{print $3}')
@@ -505,6 +608,7 @@ echo "===== APACHE TUNING ====="
 printf "%-25s | %-12s | %-12s\n" "ITEM" "ANTES" "DEPOIS"
 printf "%-25s | %-12s | %-12s\n" "MaxRequestWorkers" "$APACHE_BEFORE_MAXREQ" "$APACHE_AFTER_MAXREQ"
 printf "%-25s | %-12s | %-12s\n" "Timeout" "$APACHE_BEFORE_TIMEOUT" "$APACHE_AFTER_TIMEOUT"
+printf "%-25s | %-12s | %-12s\n" "KeepAlive" "$APACHE_BEFORE_KEEPALIVE" "$APACHE_AFTER_KEEPALIVE"
 echo
 echo "===== PHP TUNING ====="
 printf "%-25s | %-12s | %-12s\n" "ITEM" "ANTES" "DEPOIS"
