@@ -11,6 +11,11 @@
 #   - jq
 #   - GLPI API habilitada
 #
+# Execução:
+# - Colocar no Con 
+#    * crontab -e
+#    * 0 * * * * /usr/local/bin/glpi-agent-monitor.sh >/dev/null 2>&1
+#
 ################################################################################
 
 set -u
